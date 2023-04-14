@@ -312,8 +312,15 @@ drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage)
 		return NULL;
 	}
 
+/*TO DO: This might be decided at runtime if we store underlay status in pending state*/
+#ifdef HAVE_UNDERLAY
+	/* The renderer needs to produce image with transparency for underlay*/
+	ret = drm_fb_get_from_bo(bo, device, false/*true*/, BUFFER_GBM_SURFACE);
+#else
 	/* The renderer always produces an opaque image. */
 	ret = drm_fb_get_from_bo(bo, device, true, BUFFER_GBM_SURFACE);
+#endif
+
 	if (!ret) {
 		weston_log("failed to get drm_fb for bo\n");
 		gbm_surface_release_buffer(output->gbm_surface, bo);

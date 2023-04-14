@@ -2,7 +2,7 @@
 #modules=cms-colord.so
 #xwayland=true
 #shell=desktop-shell.so
-#gbm-format=xrgb2101010
+gbm-format=argb8888
 #require-input=true
 
 [shell]

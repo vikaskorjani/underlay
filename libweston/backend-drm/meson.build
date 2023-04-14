@@ -85,6 +85,7 @@ if get_option('remoting') or get_option('pipewire')
 	config_h.set('BUILD_DRM_VIRTUAL', '1')
 endif
 
+config_h.set('HAVE_UNDERLAY', '1')
 plugin_drm = shared_library(
 	'drm-backend',
 	srcs_drm,

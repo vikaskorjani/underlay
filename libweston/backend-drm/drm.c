@@ -1710,10 +1710,28 @@ drm_output_init_planes(struct drm_output *output)
 	output->scanout_plane =
 		drm_output_find_special_plane(device, output,
 					      WDRM_PLANE_TYPE_PRIMARY);
+
 	if (!output->scanout_plane) {
 		weston_log("Failed to find primary plane for output %s\n",
 			   output->base.name);
 		return -1;
+	}
+
+	output->primary_plane = output->scanout_plane;
+
+	/* Underlay: We need to have a overlay plane for underlay
+	 * based composition.
+	 * No need to stack this as all overlay are stacked as
+	 * part of create_sprites.
+	 */
+	output->overlay_plane =
+				drm_output_find_special_plane(device, output,
+				WDRM_PLANE_TYPE_OVERLAY);
+
+	if (!output->overlay_plane) {
+		weston_log("Failed to find overlay plane for output %s\n",
+			   output->base.name);
+		output->device->is_underlay_supported = false;
 	}
 
 	weston_compositor_stack_plane(b->compositor,
@@ -1771,6 +1789,8 @@ drm_output_deinit_planes(struct drm_output *output)
 
 	output->cursor_plane = NULL;
 	output->scanout_plane = NULL;
+	output->primary_plane = NULL;
+	output->overlay_plane = NULL;
 }
 
 static struct weston_drm_format_array *

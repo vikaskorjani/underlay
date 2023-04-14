@@ -310,6 +310,9 @@ struct drm_device {
 	 */
 	int min_width, max_width;
 	int min_height, max_height;
+
+	/* Underlay composition strategy support*/
+	bool is_underlay_supported;
 };
 
 struct drm_backend {
@@ -575,6 +578,12 @@ struct drm_output {
 
 	/* Plane being displayed directly on the CRTC */
 	struct drm_plane *scanout_plane;
+
+	/* Overlay plane */
+	struct drm_plane *overlay_plane;
+
+	/* Primary plane*/
+	struct drm_plane *primary_plane;
 
 	/* The last state submitted to the kernel for this CRTC. */
 	struct drm_output_state *state_cur;

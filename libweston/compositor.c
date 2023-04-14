@@ -2680,7 +2680,12 @@ view_accumulate_damage(struct weston_view *view,
 			      &view->plane->damage, &damage);
 	pixman_region32_fini(&damage);
 	pixman_region32_copy(&view->clip, opaque);
-	pixman_region32_union(opaque, opaque, &view->transform.opaque);
+	/* The opaque region here is used to find inter-plane clipping area
+	 * however, since underlay follows difference strategy this needs
+	 * to be skipped for the view enabled for underlay.
+	 */
+	if (!view->is_underlay)
+		pixman_region32_union(opaque, opaque, &view->transform.opaque);
 }
 
 static void

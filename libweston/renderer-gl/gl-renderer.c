@@ -1134,7 +1134,8 @@ gl_shader_config_init_for_paint_node(struct gl_shader_config *sconf,
 
 static void
 draw_paint_node(struct weston_paint_node *pnode,
-		pixman_region32_t *damage /* in global coordinates */)
+		pixman_region32_t *damage, pixman_region32_t *underlay_rect
+		/* in global coordinates */)
 {
 	struct gl_renderer *gr = get_renderer(pnode->surface->compositor);
 	struct gl_surface_state *gs = get_surface_state(pnode->surface);
@@ -1148,11 +1149,13 @@ draw_paint_node(struct weston_paint_node *pnode,
 	pixman_region32_t surface_blend;
 	GLint filter;
 	struct gl_shader_config sconf;
+	pixman_region32_t overlap;
 
 	if (gb->shader_variant == SHADER_VARIANT_NONE &&
-	    !buffer->direct_display)
+		!buffer->direct_display)
 		return;
 
+	pixman_region32_init(&overlap);
 	pixman_region32_init(&repaint);
 	pixman_region32_intersect(&repaint,
 				  &pnode->view->transform.boundingbox, damage);
@@ -1211,6 +1214,26 @@ draw_paint_node(struct weston_paint_node *pnode,
 		else
 			glDisable(GL_BLEND);
 
+		if (pixman_region32_not_empty(underlay_rect)) {
+			/*
+			 * Underlay: Need to clip underlay region from the opaque
+			 * region on scanout plane However, 'underlay_rect' is in
+			 * the global coordinates, and 'opaque_surface' is in the
+			 * surface-local coordinates so first translate the 'opaque_surface'
+			 * to global coordinates and then find the intersection with
+			 * 'underlay_rect' to find the region rendrer cannot draw.
+			 * Finally translate the opaque region back to surface-local coordinates.
+			 */
+			pixman_region32_translate(&surface_opaque,
+								(pnode->view->geometry.x),
+								(pnode->view->geometry.y));
+			pixman_region32_intersect(&overlap, &surface_opaque, underlay_rect);
+			pixman_region32_subtract(&surface_opaque, &surface_opaque, &overlap);
+			pixman_region32_translate(&surface_opaque,
+								-(pnode->view->geometry.x),
+								-(pnode->view->geometry.y));
+		}
+
 		repaint_region(gr, pnode->view, pnode->output,
 			       &repaint, &surface_opaque, &alt);
 		gs->used_in_output_repaint = true;
@@ -1225,13 +1248,15 @@ draw_paint_node(struct weston_paint_node *pnode,
 
 	pixman_region32_fini(&surface_blend);
 	pixman_region32_fini(&surface_opaque);
+	pixman_region32_fini(&overlap);
 
 out:
 	pixman_region32_fini(&repaint);
 }
 
 static void
-repaint_views(struct weston_output *output, pixman_region32_t *damage)
+repaint_views(struct weston_output *output, pixman_region32_t *damage,
+				pixman_region32_t *underlay_rect)
 {
 	struct weston_compositor *compositor = output->compositor;
 	struct weston_paint_node *pnode;
@@ -1239,7 +1264,7 @@ repaint_views(struct weston_output *output, pixman_region32_t *damage)
 	wl_list_for_each_reverse(pnode, &output->paint_node_z_order_list,
 				 z_order_link) {
 		if (pnode->view->plane == &compositor->primary_plane)
-			draw_paint_node(pnode, damage);
+			draw_paint_node(pnode, damage, underlay_rect);
 	}
 }
 
@@ -1724,6 +1749,7 @@ gl_renderer_repaint_output(struct weston_output *output,
 	pixman_region32_t previous_damage;
 	/* total area we need to repaint this time */
 	pixman_region32_t total_damage;
+	pixman_region32_t underlay_rect;
 	enum gl_border_status border_status = BORDER_STATUS_CLEAN;
 	struct weston_paint_node *pnode;
 	const int32_t area_inv_y =
@@ -1773,6 +1799,37 @@ gl_renderer_repaint_output(struct weston_output *output,
 			   go->area.width, go->area.height);
 	}
 
+	/* Underlay: region for which we will need to create transparent hole in scanout plane*/
+	pixman_region32_init(&underlay_rect);
+
+	/* Underlay: Based on last composition update underlay_rect region */
+	wl_list_for_each(pnode, &output->paint_node_z_order_list, z_order_link)
+	{
+		if (pnode->view->is_underlay)
+			pixman_region32_union(&underlay_rect, &underlay_rect,
+						&pnode->view->transform.boundingbox);
+	}
+
+	/* Underlay: Once underlay region is detected we will prevent renderer to draw in that
+	 * region this step ensures that stale content is cleaned up and content on primary
+	 * plane is visible
+	 */
+	if (pixman_region32_not_empty(&underlay_rect)) {
+		int i;
+		pixman_box32_t *b;
+
+		b = pixman_region32_rectangles(&underlay_rect, &i);
+
+		for (int j = 0; j < i; j++) {
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(b[j].x1, output->height - b[j].y2, (b[j].x2 - b[j].x1),
+				(b[j].y2 - b[j].y1));
+			glClearColor(0.0, 0.0, 0.0, 0.0);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glDisable(GL_SCISSOR_TEST);
+		}
+	}
+
 	/* In fan debug mode, redraw everything to make sure that we clear any
 	 * fans left over from previous draws on this buffer.
 	 * This precludes the use of EGL_EXT_swap_buffers_with_damage and
@@ -1783,7 +1840,7 @@ gl_renderer_repaint_output(struct weston_output *output,
 		pixman_region32_subtract(&undamaged, &output->region,
 					 output_damage);
 		gr->fan_debug = false;
-		repaint_views(output, &undamaged);
+		repaint_views(output, &undamaged, &underlay_rect);
 		gr->fan_debug = true;
 		pixman_region32_fini(&undamaged);
 	}
@@ -1821,20 +1878,21 @@ gl_renderer_repaint_output(struct weston_output *output,
 	if (shadow_exists(go)) {
 		/* Repaint into shadow. */
 		if (compositor->test_data.test_quirks.gl_force_full_redraw_of_shadow_fb)
-			repaint_views(output, &output->region);
+			repaint_views(output, &output->region, &underlay_rect);
 		else
-			repaint_views(output, output_damage);
+			repaint_views(output, output_damage, &underlay_rect);
 
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		glViewport(go->area.x, area_inv_y,
 			   go->area.width, go->area.height);
 		blit_shadow_to_output(output, &total_damage);
 	} else {
-		repaint_views(output, &total_damage);
+		repaint_views(output, &total_damage, &underlay_rect);
 	}
 
 	pixman_region32_fini(&total_damage);
 	pixman_region32_fini(&previous_damage);
+	pixman_region32_fini(&underlay_rect);
 
 	draw_output_borders(output, border_status);
 

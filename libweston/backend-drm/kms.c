@@ -1568,5 +1568,11 @@ init_kms_caps(struct drm_device *device)
 	weston_log("DRM: %s picture aspect ratio\n",
 		   device->aspect_ratio_supported ? "supports" : "does not support");
 
+#ifdef HAVE_UNDERLAY
+	/* TODO: Change capability name to DRM_CAP_UNDERLAY* once available*/
+	ret = drmGetCap(device->drm.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, &cap);
+	device->is_underlay_supported = (ret == 0);
+#endif
+
 	return 0;
 }

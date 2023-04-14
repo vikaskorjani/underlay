@@ -45,12 +45,14 @@
 
 enum drm_output_propose_state_mode {
 	DRM_OUTPUT_PROPOSE_STATE_MIXED, /**< mix renderer & planes */
+	DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY, /**< underlay strategy */
 	DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY, /**< only assign to renderer & cursor */
 	DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY, /**< no renderer use, only planes */
 };
 
 static const char *const drm_output_propose_state_mode_as_string[] = {
 	[DRM_OUTPUT_PROPOSE_STATE_MIXED] = "mixed state",
+	[DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY] = "underlay state",
 	[DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY] = "render-only state",
 	[DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY]	= "plane-only state"
 };
@@ -92,7 +94,9 @@ drm_output_try_view_on_plane(struct drm_plane *plane,
 	assert(!device->sprites_are_broken);
 	assert(device->atomic_modeset);
 	assert(fb);
+
 	assert(mode == DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY ||
+		   mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY ||
 	       (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED &&
 	        plane->type == WDRM_PLANE_TYPE_OVERLAY));
 
@@ -108,7 +112,7 @@ drm_output_try_view_on_plane(struct drm_plane *plane,
 	}
 
 	/* Should've been ensured by weston_view_matches_entire_output. */
-	if (plane->type == WDRM_PLANE_TYPE_PRIMARY) {
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED && plane->type == WDRM_PLANE_TYPE_PRIMARY) {
 		assert(state->dest_x == 0 && state->dest_y == 0 &&
 		       state->dest_w == (unsigned) output->base.current_mode->width &&
 		       state->dest_h == (unsigned) output->base.current_mode->height);
@@ -121,10 +125,12 @@ drm_output_try_view_on_plane(struct drm_plane *plane,
 	state->fb = drm_fb_ref(fb);
 	state->in_fence_fd = ev->surface->acquire_fence_fd;
 
-	/* In planes-only mode, we don't have an incremental state to
-	 * test against, so we just hope it'll work. */
+	/* In planes-only mode and underlay mode, we don't have an incremental
+	 * state to test against, so we just hope it'll work.
+	 */
 	if (mode != DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY &&
-	    drm_pending_state_test(output_state->pending_state) != 0) {
+		mode != DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY &&
+		drm_pending_state_test(output_state->pending_state) != 0) {
 		drm_debug(b, "\t\t\t[view] not placing view %p on plane %lu: "
 		             "atomic test failed\n",
 			  ev, (unsigned long) plane->plane_id);
@@ -524,31 +530,57 @@ drm_output_find_plane_for_view(struct drm_output_state *state,
 
 		possible_plane_mask &= ~(1 << plane->plane_idx);
 
-		switch (plane->type) {
-		case WDRM_PLANE_TYPE_CURSOR:
-			assert(buffer->shm_buffer);
-			assert(plane == output->cursor_plane);
-			break;
-		case WDRM_PLANE_TYPE_PRIMARY:
-			assert(fb);
-			if (plane != output->scanout_plane)
-				continue;
-			if (mode != DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY)
-				continue;
-			if (!view_matches_entire_output)
-				continue;
-			break;
-		case WDRM_PLANE_TYPE_OVERLAY:
-			assert(fb);
-			assert(mode != DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY);
-			/* if the view covers the whole output, put it in the
-			 * scanout plane, not overlay */
-			if (view_matches_entire_output &&
-			    !scanout_has_view_assigned)
-				continue;
-			break;
-		default:
-			assert(false && "unknown plane type");
+		/* Underlay: Plane assignement stategy is different from
+		 * normal MPO strategy since overlay plane is used as
+		 * scanout plane.
+		 */
+		if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY) {
+			switch (plane->type) {
+			case WDRM_PLANE_TYPE_CURSOR:
+				assert(buffer->shm_buffer);
+				assert(plane == output->cursor_plane);
+				break;
+			case WDRM_PLANE_TYPE_PRIMARY:
+				assert(fb);
+				if (plane != output->primary_plane)
+					continue;
+				break;
+			case WDRM_PLANE_TYPE_OVERLAY:
+				assert(fb);
+				if (plane == output->scanout_plane && !view_matches_entire_output)
+					continue;
+				break;
+			default:
+				assert(false && "unknown plane type");
+			}
+		} else {
+			switch (plane->type) {
+			case WDRM_PLANE_TYPE_CURSOR:
+				assert(buffer->shm_buffer);
+				assert(plane == output->cursor_plane);
+				break;
+			case WDRM_PLANE_TYPE_PRIMARY:
+				assert(fb);
+				if (plane != output->scanout_plane)
+					continue;
+				if (mode != DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY)
+					continue;
+				if (!view_matches_entire_output)
+					continue;
+				break;
+			case WDRM_PLANE_TYPE_OVERLAY:
+				assert(fb);
+				assert(mode != DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY);
+				/* if the view covers the whole output, put it in the
+				 * scanout plane, not overlay
+				 */
+				if (view_matches_entire_output &&
+					!scanout_has_view_assigned)
+					continue;
+				break;
+			default:
+				assert(false && "unknown plane type");
+			}
 		}
 
 		if (!drm_plane_is_available(plane, output))
@@ -642,6 +674,7 @@ drm_output_propose_state(struct weston_output *output_base,
 	struct weston_paint_node *pnode;
 	struct drm_output_state *state;
 	struct drm_plane_state *scanout_state = NULL;
+	bool underlay_view_assigned_to_primary = 0;
 
 	pixman_region32_t renderer_region;
 	pixman_region32_t occluded_region;
@@ -663,7 +696,8 @@ drm_output_propose_state(struct weston_output *output_base,
 	 * renderer framebuffer we have, if we think it's basically
 	 * compatible. If we don't have that, then we conservatively fall
 	 * back to only using the renderer for this repaint. */
-	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED) {
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED ||
+		mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY) {
 		struct drm_plane *plane = output->scanout_plane;
 		struct drm_fb *scanout_fb = plane->state_cur->fb;
 
@@ -690,16 +724,32 @@ drm_output_propose_state(struct weston_output *output_base,
 			return NULL;
 		}
 
-		scanout_state = drm_plane_state_duplicate(state,
-							  plane->state_cur);
-		/* assign the primary the lowest zpos value */
-		scanout_state->zpos = plane->zpos_min;
-		drm_debug(b, "\t\t[state] using renderer FB ID %lu for mixed "
-			     "mode for output %s (%lu)\n",
-			  (unsigned long) scanout_fb->fb_id, output->base.name,
-			  (unsigned long) output->base.id);
-		drm_debug(b, "\t\t[state] scanout will use for zpos %"PRIu64"\n",
-				scanout_state->zpos);
+		if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED) {
+			scanout_state = drm_plane_state_duplicate(state,
+								plane->state_cur);
+			/* assign the primary the lowest zpos value */
+			scanout_state->zpos = plane->zpos_min;
+			drm_debug(b, "\t\t[state] using renderer FB ID %lu for mixed "
+					"mode for output %s (%lu)\n",
+				(unsigned long) scanout_fb->fb_id, output->base.name,
+				(unsigned long) output->base.id);
+			drm_debug(b, "\t\t[state] scanout will use for zpos %"PRIu64"\n",
+					scanout_state->zpos);
+		}
+	}
+
+	/*
+	 * Using underlay composition strategy
+	 * mark overlay plane as a scanout plane and try to assign a scanout surface to primary
+	 */
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY) {
+		output->scanout_plane = output->overlay_plane;
+		/* Start with the fresh state */
+		wl_list_for_each(pnode, &output->base.paint_node_z_order_list, z_order_link)
+		{
+			if (pnode->view->is_underlay)
+				pnode->view->is_underlay = false;
+		}
 	}
 
 	/* - renderer_region contains the total region which which will be
@@ -763,6 +813,15 @@ drm_output_propose_state(struct weston_output *output_base,
 			pixman_region32_fini(&surface_overlap);
 			pixman_region32_fini(&clipped_view);
 			continue;
+		}
+
+		/* In underlay-mode of composition subsurface should not be allocated to plane */
+		if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY &&
+			ev->surface->role_name != NULL &&
+			strcmp(ev->surface->role_name, "wl_subsurface") == 0) {
+				drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane"
+					"(Underlay only main surface is assigned to plane)", ev);
+				force_renderer = true;
 		}
 
 		/* We only assign planes to views which are exclusively present
@@ -843,6 +902,12 @@ drm_output_propose_state(struct weston_output *output_base,
 			current_lowest_zpos = ps->zpos;
 			drm_debug(b, "\t\t\t[plane] next zpos to use %"PRIu64"\n",
 				      current_lowest_zpos);
+
+			if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY &&
+				ps->plane->type == WDRM_PLANE_TYPE_PRIMARY) {
+				underlay_view_assigned_to_primary = true;
+				pnode->view->is_underlay = true;
+			}
 		} else if (!ps && !renderer_ok) {
 			drm_debug(b, "\t\t[view] failing state generation: "
 				      "placing view %p to renderer not allowed\n",
@@ -851,10 +916,14 @@ drm_output_propose_state(struct weston_output *output_base,
 			goto err_region;
 		} else if (!ps) {
 			/* clipped_view contains the area that's going to be
-			 * visible on screen; add this to the renderer region */
-			pixman_region32_union(&renderer_region,
-					      &renderer_region,
-					      &clipped_view);
+			 * visible on screen; add this to the renderer region
+			 * only if it is opaque because the renderer_region is
+			 * used to compute occluded region.
+			 */
+			if (weston_view_is_opaque(ev, &clipped_view))
+				pixman_region32_union(&renderer_region,
+									&renderer_region,
+									&clipped_view);
 
 			drm_debug(b, "\t\t\t\t[view] view %p will be placed "
 				     "on the renderer\n", ev);
@@ -879,9 +948,17 @@ drm_output_propose_state(struct weston_output *output_base,
 	pixman_region32_fini(&renderer_region);
 	pixman_region32_fini(&occluded_region);
 
-	/* In renderer-only mode, we can't test the state as we don't have a
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY &&
+		!underlay_view_assigned_to_primary) {
+		drm_debug(b, "\t\t [view] failing state generation: "
+					"underlay no view assigned to primary \n");
+		goto err;
+	}
+
+	/* In renderer-only or underlay mode, we can't test the state as we don't have a
 	 * renderer buffer yet. */
-	if (mode == DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY)
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY ||
+		mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY)
 		return state;
 
 	/* check if we have invalid zpos values, like duplicate(s) */
@@ -899,7 +976,8 @@ drm_output_propose_state(struct weston_output *output_base,
 	 * function: if we have taken a renderer framebuffer and placed it in
 	 * the pending state in order to incrementally test overlay planes,
 	 * remove it now. */
-	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED) {
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED ||
+		mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY) {
 		assert(scanout_state->fb->type == BUFFER_GBM_SURFACE ||
 		       scanout_state->fb->type == BUFFER_PIXMAN_DUMB);
 		drm_plane_state_put_back(scanout_state);
@@ -910,6 +988,14 @@ err_region:
 	pixman_region32_fini(&renderer_region);
 	pixman_region32_fini(&occluded_region);
 err:
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY) {
+		output->scanout_plane = output->primary_plane;
+		wl_list_for_each(pnode, &output->base.paint_node_z_order_list, z_order_link) {
+			if (pnode->view->is_underlay)
+				pnode->view->is_underlay = false;
+		}
+	}
+
 	drm_output_state_free(state);
 	return NULL;
 }
@@ -935,8 +1021,17 @@ drm_assign_planes(struct weston_output *output_base)
 	if (!device->sprites_are_broken && !output->virtual && b->gbm) {
 		drm_debug(b, "\t[repaint] trying planes-only build state\n");
 		state = drm_output_propose_state(output_base, pending_state, mode);
-		if (!state) {
+		if (!state && device->is_underlay_supported) {
 			drm_debug(b, "\t[repaint] could not build planes-only "
+				     "state, trying underlay\n");
+			 mode = DRM_OUTPUT_PROPOSE_STATE_MIXED_UNDERLAY;
+			state = drm_output_propose_state(output_base,
+							 pending_state,
+							 mode);
+		}
+
+		if (!state) {
+			drm_debug(b, "\t[repaint] could not build underlay "
 				     "state, trying mixed\n");
 			mode = DRM_OUTPUT_PROPOSE_STATE_MIXED;
 			state = drm_output_propose_state(output_base,
