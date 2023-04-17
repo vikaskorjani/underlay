@@ -1344,6 +1344,13 @@ display_update_supported_modifiers_for_egl(struct display *d)
 		goto error;
 	}
 
+	for (i = 0; i < d->modifiers_count; ++i) {
+        d->modifiers[i] = DRM_FORMAT_MOD_INVALID;
+	}
+
+	d->modifiers[0] = egl_modifiers[5] ;
+
+#if 0
 	/* Poor person's set intersection: d->modifiers INTERSECT
 	 * egl_modifiers.  If a modifier is not supported, replace it with
 	 * DRM_FORMAT_MOD_INVALID in the d->modifiers array.
@@ -1363,7 +1370,7 @@ display_update_supported_modifiers_for_egl(struct display *d)
 		if (!egl_supported)
 			d->modifiers[i] = DRM_FORMAT_MOD_INVALID;
 	}
-
+#endif
 	free(egl_modifiers);
 
 	return true;
@@ -1522,7 +1529,7 @@ main(int argc, char **argv)
 	struct sigaction sigint;
 	struct display *display;
 	struct window *window;
-	uint32_t format = DRM_FORMAT_XRGB8888;
+	uint32_t format = DRM_FORMAT_ARGB8888;
 	int opts = 0;
 	char const *drm_render_node = "/dev/dri/renderD128";
 	int c, option_index, ret = 0;
