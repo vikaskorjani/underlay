@@ -579,6 +579,13 @@ static const struct pixel_format_info pixel_format_table[] = {
 		DRM_FORMAT(XYUV8888),
 		.bpp = 32,
 	},
+	{
+		DRM_FORMAT(P010),
+		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
+		.num_planes = 2,
+		.hsub = 2,
+		.vsub = 2,
+	},
 };
 
 WL_EXPORT const struct pixel_format_info *
