@@ -62,6 +62,7 @@
 
 //#include "color-management-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "weston-direct-display-client-protocol.h"
 
 #include "shared/os-compatibility.h"
 #include "shared/helpers.h"
@@ -74,6 +75,7 @@
     fprintf(stderr, "%d:%s " fmt, __LINE__, __func__, ##__VA_ARGS__)
 
 #define NUM_BUFFERS 3
+#define DIRECT_SCANOUT 1
 
 #ifndef DRM_FORMAT_MOD_LINEAR
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -98,7 +100,8 @@ static char* option_input_file;
 static uint32_t option_pixel_format;
 static uint32_t option_width;
 static uint32_t option_height;
-static uint32_t option_color_space;
+//static uint32_t option_color_space;
+static uint32_t option_direct_scanout;
 
 static const struct weston_option options[] = {
     { WESTON_OPTION_BOOLEAN, "fullscreen", 'f', &option_fullscreen },
@@ -107,7 +110,8 @@ static const struct weston_option options[] = {
     { WESTON_OPTION_STRING, "pixel_format", 'p', &option_pixel_format },
     { WESTON_OPTION_INTEGER, "width", 'w', &option_width },
     { WESTON_OPTION_INTEGER, "height", 'h', &option_height },
-    { WESTON_OPTION_INTEGER, "color_space", 'c', &option_color_space },
+    //{ WESTON_OPTION_INTEGER, "color_space", 'c', &option_color_space },
+    { WESTON_OPTION_INTEGER, "direct_scanout", 'd', &option_direct_scanout },
     { WESTON_OPTION_STRING, "help", 'x', &option_help },
 };
 
@@ -128,13 +132,14 @@ static const char help_text[] =
 "                   XRGB2101010\n"
 "   -w, --width\t\tWidth of the input image file\n"
 "   -h, --height\t\tHeight of the input file\n"
-"   -c, --color_space\t\tClient color space\n"
+/*"   -c, --color_space\t\tClient color space\n"
 "                   BT601_525 \n"
 "                   BT601_625 \n"
 "                   BT709\n"
 "                   BT2020 \n"
 "                   DISPLAYP3\n"
-"                   ADOBERGB\n"
+"                   ADOBERGB\n"*/
+"   -d, --direct_scanout\t\tEnable/Disable the direct scanout\n"
 "   -x, --help\t\tShow this help text\n"
 "\n";
 
@@ -200,6 +205,7 @@ struct app {
     //struct zwp_color_space_v1 *color_space;
     //struct zwp_color_management_surface_v1 *cm_surface;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    struct weston_direct_display_v1 *direct_display;
 };
 
 static int
@@ -891,6 +897,9 @@ global_handler(struct display *display, uint32_t id,
         zwp_linux_dmabuf_v1_add_listener(app->dmabuf,
                          &dmabuf_listener,
                          app);
+    } else if (strcmp(interface, "weston_direct_display_v1") == 0) {
+        app->direct_display = display_bind(display, id,
+                                &weston_direct_display_v1_interface, 1);
     }
 }
 
@@ -932,6 +941,7 @@ create_dmabuf_buffer(struct app *app, struct buffer *buffer,
     uint32_t flags = 0;
     unsigned buf_w, buf_h;
     int pixel_format;
+    uint32_t direct_scanout;
 
     memset(buffer, 0, sizeof(*buffer));
     if (!gbm_init(buffer)) {
@@ -942,6 +952,7 @@ create_dmabuf_buffer(struct app *app, struct buffer *buffer,
     buffer->width = width;
     buffer->height = height;
     buffer->format = format;
+    direct_scanout = option_direct_scanout;
 
     buf_w = width;
     buf_h = height;
@@ -1001,6 +1012,19 @@ create_dmabuf_buffer(struct app *app, struct buffer *buffer,
     }
 
     params = zwp_linux_dmabuf_v1_create_params(app->dmabuf);
+
+#if DIRECT_SCANOUT
+    if (direct_scanout && app->direct_display) {
+        weston_direct_display_v1_enable(app->direct_display, params);
+        /* turn off Y_INVERT otherwise linux-dmabuf will reject it and
+         * we need all dmabuf flags turned off */
+        flags &= ~ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_Y_INVERT;
+
+        fprintf(stdout, "image is y-inverted as direct-display flag was set, "
+                        "dmabuf y-inverted attribute flag was removed\n");
+    }
+#endif
+
     zwp_linux_buffer_params_v1_add(params,
                        buffer->dmabuf_fd,
                        0, /* plane_idx */
@@ -1278,6 +1302,10 @@ main(int argc, char *argv[])
             /*case 'c':
                 option_color_space = parse_color_space(optarg);
                 break;*/
+
+            case 'd':
+                option_direct_scanout = atoi(optarg);
+                break;
 
             case 'x':
             default:
